@@ -1,13 +1,12 @@
 # ALSA Driver for TASCAM US-1800
 
 ## Project Status
+* This is an update to the TASCAM US-1800 driver.
 
 ### Implemented Features
-*   **Audio Playback:**
-*   **Audio Capture (Recording):** 
-
-### To-Do & Known Limitations
-* Implement MIDI IN/OUT(TBD) 
+*   **Audio Playback:** Added silent playback function to allow Capture and MIDI IN/OUT to function with no ALSA playback stream.
+*   **Audio Capture (Recording):** Increased Capture packet size and added trigger for silent playback.
+*   **MIDI IN/OUT:** Adapted us144mkii_midi module and header to operate with US-1800
 
 ## Installation and Usage
 

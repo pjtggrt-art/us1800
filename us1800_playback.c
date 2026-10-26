@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 Šerif Rami <ramiserifpersia@gmail.com>
+// Revised October 2026 Paul Taggart <pjtggrt@gmail.com>
 
 #include "us1800_pcm.h"
 
 const struct snd_pcm_hardware us1800_playback_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
-	SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID |
-	SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+	SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID),
 	.formats = SNDRV_PCM_FMTBIT_S24_3LE,
 	.rates = (SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 	SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000),
@@ -18,7 +18,7 @@ const struct snd_pcm_hardware us1800_playback_hw = {
 	.period_bytes_min = 576,
 	.period_bytes_max = 1024 * 1024,
 	.periods_min = 2,
-	.periods_max = 1024,
+	.periods_max = 4096,
 };
 
 static int us1800_playback_open(struct snd_pcm_substream *substream)
@@ -27,7 +27,8 @@ static int us1800_playback_open(struct snd_pcm_substream *substream)
 
 	substream->runtime->hw = us1800_playback_hw;
 	us1800->playback_substream = substream;
-	atomic_set(&us1800->playback_active, 0);
+	if (!atomic_read(&us1800->playback_zero))
+		atomic_set(&us1800->playback_active, 0);
 	return 0;
 }
 
@@ -35,12 +36,14 @@ static int us1800_playback_close(struct snd_pcm_substream *substream)
 {
 	struct us1800_card *us1800 = snd_pcm_substream_chip(substream);
 
-	atomic_set(&us1800->playback_active, 0);
+	if (!atomic_read(&us1800->playback_zero)) {
+		atomic_set(&us1800->playback_active, 0);
 
-	usb_kill_anchored_urbs(&us1800->playback_anchor);
-	usb_kill_anchored_urbs(&us1800->feedback_anchor);
+		usb_kill_anchored_urbs(&us1800->playback_anchor);
+		usb_kill_anchored_urbs(&us1800->feedback_anchor);
 
-	us1800->playback_substream = NULL;
+		us1800->playback_substream = NULL;
+	}
 	return 0;
 }
 
@@ -49,46 +52,53 @@ static int us1800_playback_prepare(struct snd_pcm_substream *substream)
 	struct us1800_card *us1800 = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	int i, u;
-	size_t nominal_bytes = (runtime->rate / 8000) * PLAYBACK_FRAME_SIZE;
-
-	usb_kill_anchored_urbs(&us1800->playback_anchor);
-	usb_kill_anchored_urbs(&us1800->feedback_anchor);
 
 	us1800->driver_playback_pos = 0;
 	us1800->playback_frames_consumed = 0;
 	us1800->last_pb_period_pos = 0;
-	us1800->feedback_synced = false;
 
-	us1800->feedback_urb_skip_count = 4;
+	if (!atomic_read(&us1800->playback_active)) {
+	
+		size_t nominal_bytes = (runtime->rate / 8000) * PLAYBACK_FRAME_SIZE;
 
-	us1800->phase_accum = 0;
-	us1800->freq_q16 = div_u64(((u64)runtime->rate << 16), 8000);
+		if (nominal_bytes > MAX_FRAMES_PER_PACKET * PLAYBACK_FRAME_SIZE)
+			nominal_bytes = MAX_FRAMES_PER_PACKET * PLAYBACK_FRAME_SIZE;
+		
+		usb_kill_anchored_urbs(&us1800->playback_anchor);
+		usb_kill_anchored_urbs(&us1800->feedback_anchor);
 
-	for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
-		struct urb *f_urb = us1800->feedback_urbs[i];
+		us1800->feedback_urb_skip_count = 4;
 
-		f_urb->number_of_packets = FEEDBACK_URB_PACKETS;
-		f_urb->transfer_buffer_length = FEEDBACK_URB_PACKETS * FEEDBACK_PACKET_SIZE;
-		for (u = 0; u < FEEDBACK_URB_PACKETS; u++) {
-			f_urb->iso_frame_desc[u].offset = u * FEEDBACK_PACKET_SIZE;
-			f_urb->iso_frame_desc[u].length = FEEDBACK_PACKET_SIZE;
-		}
-	}
+		us1800->phase_accum = 0;
+		us1800->freq_q16 = div_u64(((u64)runtime->rate << 16), 8000);
 
-	for (u = 0; u < NUM_PLAYBACK_URBS; u++) {
-		struct urb *urb = us1800->playback_urbs[u];
-		size_t total_bytes = 0;
+		for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+			struct urb *f_urb = us1800->feedback_urbs[i];
 
-		urb->number_of_packets = PLAYBACK_URB_PACKETS;
-
-		for (i = 0; i < PLAYBACK_URB_PACKETS; i++) {
-			urb->iso_frame_desc[i].offset = i * nominal_bytes;
-			urb->iso_frame_desc[i].length = nominal_bytes;
-			total_bytes += nominal_bytes;
+			f_urb->number_of_packets = FEEDBACK_URB_PACKETS;
+			f_urb->transfer_buffer_length = FEEDBACK_URB_PACKETS * FEEDBACK_PACKET_SIZE;
+			for (u = 0; u < FEEDBACK_URB_PACKETS; u++) {
+				f_urb->iso_frame_desc[u].offset = u * FEEDBACK_PACKET_SIZE;
+				f_urb->iso_frame_desc[u].length = FEEDBACK_PACKET_SIZE;
+			}
 		}
 
-		urb->transfer_buffer_length = total_bytes;
-		memset(urb->transfer_buffer, 0, total_bytes);
+		for (u = 0; u < NUM_PLAYBACK_URBS; u++) {
+			struct urb *urb = us1800->playback_urbs[u];
+			size_t total_bytes = 0;
+
+			urb->number_of_packets = PLAYBACK_URB_PACKETS;
+
+			for (i = 0; i < PLAYBACK_URB_PACKETS; i++) {
+				urb->iso_frame_desc[i].offset = i * nominal_bytes;
+				urb->iso_frame_desc[i].length = nominal_bytes;
+				total_bytes += nominal_bytes;
+			}
+
+			urb->transfer_buffer_length = total_bytes;
+			memset(urb->transfer_buffer, 0, total_bytes);
+		}
+		
 	}
 	return 0;
 }
@@ -112,7 +122,7 @@ static snd_pcm_uframes_t us1800_playback_pointer(struct snd_pcm_substream *subst
 static int us1800_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct us1800_card *us1800 = snd_pcm_substream_chip(substream);
-	int i, ret = 0;
+	int i, ret;
 	unsigned long flags;
 
 	switch (cmd) {
@@ -124,51 +134,68 @@ static int us1800_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 				spin_unlock_irqrestore(&us1800->lock, flags);
 				return -EBUSY;
 			}
-			if (atomic_read(&us1800->playback_active)) {
+			if (!atomic_read(&us1800->playback_zero) &&
+				atomic_read(&us1800->playback_active)) {
 				spin_unlock_irqrestore(&us1800->lock, flags);
 				return 0;
 			}
-			atomic_set(&us1800->playback_active, 1);
-			us1800->feedback_synced = false;
-			spin_unlock_irqrestore(&us1800->lock, flags);
+			
+			if (!atomic_read(&us1800->playback_zero)) {
+				atomic_set(&us1800->playback_active, 1);
+				us1800->feedback_synced = false;
+				spin_unlock_irqrestore(&us1800->lock, flags);
 
-			for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
-				usb_anchor_urb(us1800->feedback_urbs[i], &us1800->feedback_anchor);
-				if (usb_submit_urb(us1800->feedback_urbs[i], GFP_ATOMIC) < 0) {
-					usb_unanchor_urb(us1800->feedback_urbs[i]);
-					ret = -EIO;
-					goto error;
+				for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+					usb_anchor_urb(us1800->feedback_urbs[i], &us1800->feedback_anchor);
+					if (usb_submit_urb(us1800->feedback_urbs[i], GFP_ATOMIC) < 0) {
+						usb_unanchor_urb(us1800->feedback_urbs[i]);
+						ret = -EIO;
+						goto error;
+					}
+					atomic_inc(&us1800->active_urbs);
 				}
-				atomic_inc(&us1800->active_urbs);
-			}
 
-			for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
-				usb_anchor_urb(us1800->playback_urbs[i], &us1800->playback_anchor);
-				if (usb_submit_urb(us1800->playback_urbs[i], GFP_ATOMIC) < 0) {
-					usb_unanchor_urb(us1800->playback_urbs[i]);
-					ret = -EIO;
-					goto error;
+				for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
+					usb_anchor_urb(us1800->playback_urbs[i], &us1800->playback_anchor);
+					if (usb_submit_urb(us1800->playback_urbs[i], GFP_ATOMIC) < 0) {
+						usb_unanchor_urb(us1800->playback_urbs[i]);
+						ret = -EIO;
+						goto error;
+					}
+					atomic_inc(&us1800->active_urbs);
 				}
-				atomic_inc(&us1800->active_urbs);
+			} else {
+				atomic_set(&us1800->playback_active, 1);
+				atomic_set(&us1800->playback_zero, 0);
+				spin_unlock_irqrestore(&us1800->lock, flags);
 			}
 			break;
+
 
 		case SNDRV_PCM_TRIGGER_STOP:
 		case SNDRV_PCM_TRIGGER_SUSPEND:
 		case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-			atomic_set(&us1800->playback_active, 0);
+			if (!atomic_read(&us1800->playback_zero)) {
+				if (!atomic_read(&us1800->capture_active) &&
+					!atomic_read(&us1800->midi_in_active) &&
+					!atomic_read(&us1800->midi_out_active)) {
+					atomic_set(&us1800->playback_active, 0);
+	
+					for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
+						if (us1800->playback_urbs[i])
+							usb_unlink_urb(us1800->playback_urbs[i]);
+					}
+					for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+						if (us1800->feedback_urbs[i])
+						usb_unlink_urb(us1800->feedback_urbs[i]);
+					}
 
-			for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
-				if (us1800->playback_urbs[i])
-					usb_unlink_urb(us1800->playback_urbs[i]);
-			}
-			for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
-				if (us1800->feedback_urbs[i])
-					usb_unlink_urb(us1800->feedback_urbs[i]);
-			}
-
-			if (!atomic_read(&us1800->capture_active)) {
-				schedule_work(&us1800->stop_work);
+					schedule_work(&us1800->stop_work);
+				} else {
+					spin_lock_irqsave(&us1800->lock, flags);
+					atomic_set(&us1800->playback_zero, 1);
+					spin_unlock_irqrestore(&us1800->lock, flags);
+				}
 			}
 			break;
 
@@ -180,9 +207,115 @@ static int us1800_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	error:
 	atomic_set(&us1800->playback_active, 0);
+	atomic_set(&us1800->playback_zero, 0);
 	usb_kill_anchored_urbs(&us1800->playback_anchor);
 	usb_kill_anchored_urbs(&us1800->feedback_anchor);
 	return ret;
+}
+
+void us1800_zero_trigger(struct us1800_card *us1800, bool start)
+{
+	int i, u, ret;
+	unsigned long flags;
+
+	if (start) {
+		if (!atomic_read(&us1800->playback_active)) {
+			size_t nominal_bytes = (us1800->current_rate / 8000) * PLAYBACK_FRAME_SIZE;
+
+			if (nominal_bytes > MAX_FRAMES_PER_PACKET * PLAYBACK_FRAME_SIZE)
+				nominal_bytes = MAX_FRAMES_PER_PACKET * PLAYBACK_FRAME_SIZE;
+		
+			usb_kill_anchored_urbs(&us1800->playback_anchor);
+			usb_kill_anchored_urbs(&us1800->feedback_anchor);
+
+			us1800->feedback_urb_skip_count = 4;
+
+			us1800->phase_accum = 0;
+			us1800->freq_q16 = div_u64(((u64)us1800->current_rate << 16), 8000);
+
+			for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+				struct urb *urb = us1800->feedback_urbs[i];
+
+				urb->number_of_packets = FEEDBACK_URB_PACKETS;
+				urb->transfer_buffer_length = FEEDBACK_URB_PACKETS * FEEDBACK_PACKET_SIZE;
+				for (u = 0; u < FEEDBACK_URB_PACKETS; u++) {
+					urb->iso_frame_desc[u].offset = u * FEEDBACK_PACKET_SIZE;
+					urb->iso_frame_desc[u].length = FEEDBACK_PACKET_SIZE;
+				}
+			}
+
+			for (u = 0; u < NUM_PLAYBACK_URBS; u++) {
+				struct urb *urb = us1800->playback_urbs[u];
+				size_t total_bytes = 0;
+
+				urb->number_of_packets = PLAYBACK_URB_PACKETS;
+
+				for (i = 0; i < PLAYBACK_URB_PACKETS; i++) {
+					urb->iso_frame_desc[i].offset = i * nominal_bytes;
+					urb->iso_frame_desc[i].length = nominal_bytes;
+					total_bytes += nominal_bytes;
+				}
+
+				urb->transfer_buffer_length = total_bytes;
+				memset(urb->transfer_buffer, 0, total_bytes);
+			}
+
+			spin_lock_irqsave(&us1800->lock, flags);
+			atomic_set(&us1800->playback_active, 1);
+			atomic_set(&us1800->playback_zero, 1);
+			us1800->feedback_synced = false;
+			spin_unlock_irqrestore(&us1800->lock, flags);
+			
+			for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+				usb_anchor_urb(us1800->feedback_urbs[i], &us1800->feedback_anchor);
+				if (usb_submit_urb(us1800->feedback_urbs[i], GFP_ATOMIC) < 0) {
+					usb_unanchor_urb(us1800->feedback_urbs[i]);
+					ret = -EIO;
+					goto uerror;
+				}
+				atomic_inc(&us1800->active_urbs);
+			}
+
+			for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
+				usb_anchor_urb(us1800->playback_urbs[i], &us1800->playback_anchor);
+				if (usb_submit_urb(us1800->playback_urbs[i], GFP_ATOMIC) < 0) {
+					usb_unanchor_urb(us1800->playback_urbs[i]);
+					ret = -EIO;
+					goto uerror;
+				}
+				atomic_inc(&us1800->active_urbs);
+			}
+		}
+	} else {
+		if (!atomic_read(&us1800->capture_active) &&
+			!atomic_read(&us1800->midi_in_active) &&
+			!atomic_read(&us1800->midi_out_active) &&
+			atomic_read(&us1800->playback_zero)) {
+			
+			atomic_set(&us1800->playback_active, 0);
+			atomic_set(&us1800->playback_zero, 0);
+	
+			for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
+				if (us1800->playback_urbs[i])
+					usb_unlink_urb(us1800->playback_urbs[i]);
+			}
+			for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+				if (us1800->feedback_urbs[i])
+				usb_unlink_urb(us1800->feedback_urbs[i]);
+			}
+
+			schedule_work(&us1800->stop_work);
+		}
+	}
+
+	return;
+
+	uerror:
+	atomic_set(&us1800->playback_active, 0);
+	atomic_set(&us1800->playback_zero, 0);
+	usb_kill_anchored_urbs(&us1800->playback_anchor);
+	usb_kill_anchored_urbs(&us1800->feedback_anchor);
+	return;
 }
 
 void playback_urb_complete(struct urb *urb)
@@ -206,17 +339,12 @@ void playback_urb_complete(struct urb *urb)
 	if (!atomic_read(&us1800->playback_active))
 		goto exit_clear;
 
-	substream = us1800->playback_substream;
-	runtime = substream->runtime;
-
-	spin_lock_irqsave(&us1800->lock, flags);
-
 	for (i = 0; i < urb->number_of_packets; i++) {
 		unsigned int frames_for_packet;
 
 		us1800->phase_accum += us1800->freq_q16;
 		frames_for_packet = us1800->phase_accum >> 16;
-		us1800->phase_accum &= 0xFFFF;
+		us1800->phase_accum &= 0xFFFF; 
 
 		if (frames_for_packet > MAX_FRAMES_PER_PACKET)
 			frames_for_packet = MAX_FRAMES_PER_PACKET;
@@ -228,35 +356,45 @@ void playback_urb_complete(struct urb *urb)
 	urb->transfer_buffer_length = total_bytes_for_urb;
 
 	if (total_bytes_for_urb > 0) {
-		u8 *dst_buf = urb->transfer_buffer;
-		size_t ptr_bytes = frames_to_bytes(runtime, us1800->driver_playback_pos);
-		frames_to_copy = bytes_to_frames(runtime, total_bytes_for_urb);
-
-		if (us1800->driver_playback_pos + frames_to_copy > runtime->buffer_size) {
-			size_t part1 = runtime->buffer_size - us1800->driver_playback_pos;
-			size_t part1_bytes = frames_to_bytes(runtime, part1);
-
-			memcpy(dst_buf, runtime->dma_area + ptr_bytes, part1_bytes);
-			memcpy(dst_buf + part1_bytes, runtime->dma_area, total_bytes_for_urb - part1_bytes);
+		if (atomic_read(&us1800->playback_zero)) {
+			memset(urb->transfer_buffer, 0, total_bytes_for_urb);
 		} else {
-			memcpy(dst_buf, runtime->dma_area + ptr_bytes, total_bytes_for_urb);
-		}
+			substream = us1800->playback_substream;
+			runtime = substream->runtime;
 
-		us1800->driver_playback_pos += frames_to_copy;
-		if (us1800->driver_playback_pos >= runtime->buffer_size)
-			us1800->driver_playback_pos -= runtime->buffer_size;
+			spin_lock_irqsave(&us1800->lock, flags);
 
-		us1800->playback_frames_consumed += frames_to_copy;
+			u8 *dst_buf = urb->transfer_buffer;
+			size_t ptr_bytes = frames_to_bytes(runtime, us1800->driver_playback_pos);
+			frames_to_copy = bytes_to_frames(runtime, total_bytes_for_urb);
 
-		if (div_u64(us1800->playback_frames_consumed, runtime->period_size) > us1800->last_pb_period_pos) {
-			us1800->last_pb_period_pos = div_u64(us1800->playback_frames_consumed, runtime->period_size);
-			need_period_elapsed = true;
+			if (us1800->driver_playback_pos + frames_to_copy > runtime->buffer_size) {
+				size_t part1 = runtime->buffer_size - us1800->driver_playback_pos;
+				size_t part1_bytes = frames_to_bytes(runtime, part1);
+
+				memcpy(dst_buf, runtime->dma_area + ptr_bytes, part1_bytes);
+				memcpy(dst_buf + part1_bytes, runtime->dma_area, total_bytes_for_urb - part1_bytes);
+			} else {
+				memcpy(dst_buf, runtime->dma_area + ptr_bytes, total_bytes_for_urb);
+			}
+
+			us1800->driver_playback_pos += frames_to_copy;
+			if (us1800->driver_playback_pos >= runtime->buffer_size)
+				us1800->driver_playback_pos -= runtime->buffer_size;
+
+			us1800->playback_frames_consumed += frames_to_copy;
+
+			if (div_u64(us1800->playback_frames_consumed, runtime->period_size) > us1800->last_pb_period_pos) {
+				us1800->last_pb_period_pos = div_u64(us1800->playback_frames_consumed, runtime->period_size);
+				need_period_elapsed = true;
+			}
+			spin_unlock_irqrestore(&us1800->lock, flags);
+
+			if (need_period_elapsed)
+				snd_pcm_period_elapsed(substream);
+
 		}
 	}
-	spin_unlock_irqrestore(&us1800->lock, flags);
-
-	if (need_period_elapsed)
-		snd_pcm_period_elapsed(substream);
 
 	usb_anchor_urb(urb, &us1800->playback_anchor);
 	if (usb_submit_urb(urb, GFP_ATOMIC) < 0)

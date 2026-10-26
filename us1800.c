@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 Šerif Rami <ramiserifpersia@gmail.com>
+// Revised October 2026 Paul Taggart <pjtggrt@gmail.com>
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -20,8 +21,6 @@ static atomic_t dev_idx = ATOMIC_INIT(0);
 
 static int us1800_probe(struct usb_interface *intf, const struct usb_device_id *usb_id);
 static void us1800_disconnect(struct usb_interface *intf);
-static int us1800_suspend(struct usb_interface *intf, pm_message_t message);
-static int us1800_resume(struct usb_interface *intf);
 
 void us1800_free_urbs(struct us1800_card *us1800)
 {
@@ -30,6 +29,8 @@ void us1800_free_urbs(struct us1800_card *us1800)
 	usb_kill_anchored_urbs(&us1800->playback_anchor);
 	usb_kill_anchored_urbs(&us1800->feedback_anchor);
 	usb_kill_anchored_urbs(&us1800->capture_anchor);
+	usb_kill_anchored_urbs(&us1800->midi_in_anchor);
+	usb_kill_anchored_urbs(&us1800->midi_out_anchor);
 
 	for (i = 0; i < NUM_PLAYBACK_URBS; i++) {
 		if (us1800->playback_urbs[i]) {
@@ -60,6 +61,28 @@ void us1800_free_urbs(struct us1800_card *us1800)
 			us1800->capture_urbs[i] = NULL;
 		}
 	}
+	for (i = 0; i < NUM_MIDI_IN_URBS; i++) {
+		if (us1800->midi_in_urbs[i]) {
+			usb_free_coherent(
+				us1800->dev, MIDI_IN_BUF_SIZE,
+				us1800->midi_in_urbs[i]->transfer_buffer,
+				us1800->midi_in_urbs[i]->transfer_dma);
+			usb_free_urb(us1800->midi_in_urbs[i]);
+			us1800->midi_in_urbs[i] = NULL;
+		}
+	}
+
+	for (i = 0; i < NUM_MIDI_OUT_URBS; i++) {
+		if (us1800->midi_out_urbs[i]) {
+			usb_free_coherent(
+				us1800->dev, MIDI_OUT_BUF_SIZE,
+				us1800->midi_out_urbs[i]->transfer_buffer,
+				us1800->midi_out_urbs[i]->transfer_dma);
+			usb_free_urb(us1800->midi_out_urbs[i]);
+			us1800->midi_out_urbs[i] = NULL;
+		}
+	}
+
 }
 
 int us1800_alloc_urbs(struct us1800_card *us1800)
@@ -125,6 +148,44 @@ int us1800_alloc_urbs(struct us1800_card *us1800)
 		urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 	}
 
+	/* MIDI URB and buffer allocation */
+	for (i = 0; i < NUM_MIDI_IN_URBS; i++) {
+		struct urb *m_urb = usb_alloc_urb(0, GFP_KERNEL);
+
+		if (!m_urb)
+			return -ENOMEM;
+		us1800->midi_in_urbs[i] = m_urb;
+		m_urb->transfer_buffer =
+			usb_alloc_coherent(us1800->dev, MIDI_IN_BUF_SIZE,
+					   GFP_KERNEL, &m_urb->transfer_dma);
+		if (!m_urb->transfer_buffer)
+			return -ENOMEM;
+		usb_fill_bulk_urb(m_urb, us1800->dev,
+				  usb_rcvbulkpipe(us1800->dev, EP_MIDI_IN),
+				  m_urb->transfer_buffer, MIDI_IN_BUF_SIZE,
+				  us1800_midi_in_urb_complete, us1800);
+		m_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	}
+
+	for (i = 0; i < NUM_MIDI_OUT_URBS; i++) {
+		struct urb *m_urb = usb_alloc_urb(0, GFP_KERNEL);
+
+		if (!m_urb)
+			return -ENOMEM;
+		us1800->midi_out_urbs[i] = m_urb;
+		m_urb->transfer_buffer =
+			usb_alloc_coherent(us1800->dev, MIDI_OUT_BUF_SIZE,
+					   GFP_KERNEL, &m_urb->transfer_dma);
+		if (!m_urb->transfer_buffer)
+			return -ENOMEM;
+		usb_fill_bulk_urb(m_urb, us1800->dev,
+				  usb_sndbulkpipe(us1800->dev, EP_MIDI_OUT),
+				  m_urb->transfer_buffer,
+				  0, /* length set later */
+				  us1800_midi_out_urb_complete, us1800);
+		m_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	}
+
 	return 0;
 }
 
@@ -135,6 +196,8 @@ void us1800_stop_work_handler(struct work_struct *work)
 	usb_kill_anchored_urbs(&us1800->playback_anchor);
 	usb_kill_anchored_urbs(&us1800->feedback_anchor);
 	usb_kill_anchored_urbs(&us1800->capture_anchor);
+	usb_kill_anchored_urbs(&us1800->midi_in_anchor);
+	usb_kill_anchored_urbs(&us1800->midi_out_anchor);
 
 	if (!atomic_read(&us1800->playback_active) && !atomic_read(&us1800->capture_active)) {
 		usb_control_msg(us1800->dev, usb_sndctrlpipe(us1800->dev, 0),
@@ -148,12 +211,24 @@ static void us1800_card_private_free(struct snd_card *card)
 	struct us1800_card *us1800 = card->private_data;
 
 	if (us1800) {
+		kfifo_free(&us1800->midi_in_fifo);
 		us1800_free_urbs(us1800);
 		if (us1800->dev) {
 			usb_put_dev(us1800->dev);
 			us1800->dev = NULL;
 		}
 	}
+}
+
+static void us1800_error_timer(struct timer_list *t)
+{
+	struct us1800_card *us1800 =
+		container_of(t, struct us1800_card, error_timer);
+
+	if (atomic_read(&us1800->midi_in_active))
+		schedule_work(&us1800->midi_in_work);
+	if (atomic_read(&us1800->midi_out_active))
+		schedule_work(&us1800->midi_out_work);
 }
 
 static int us1800_probe(struct usb_interface *intf, const struct usb_device_id *usb_id)
@@ -193,12 +268,25 @@ static int us1800_probe(struct usb_interface *intf, const struct usb_device_id *
 	us1800->iface0 = intf;
 
 	spin_lock_init(&us1800->lock);
+	spin_lock_init(&us1800->midi_in_lock);
+	spin_lock_init(&us1800->midi_out_lock);
 	init_usb_anchor(&us1800->playback_anchor);
 	init_usb_anchor(&us1800->feedback_anchor);
 	init_usb_anchor(&us1800->capture_anchor);
+	init_usb_anchor(&us1800->midi_in_anchor);
+	init_usb_anchor(&us1800->midi_out_anchor);
+
+	timer_setup(&us1800->error_timer, us1800_error_timer, 0);
 
 	INIT_WORK(&us1800->stop_work, us1800_stop_work_handler);
 	INIT_WORK(&us1800->stop_pcm_work, us1800_stop_pcm_work_handler);
+	init_completion(&us1800->midi_out_drain_completion);
+
+	if (kfifo_alloc(&us1800->midi_in_fifo, MIDI_IN_FIFO_SIZE, GFP_KERNEL)) {
+		snd_card_free(card);
+		goto free_card;
+	}
+
 
 	strscpy(card->driver, DRIVER_NAME, sizeof(card->driver));
 	strscpy(card->shortname, "US-1800", sizeof(card->shortname));
@@ -256,6 +344,10 @@ static int us1800_probe(struct usb_interface *intf, const struct usb_device_id *
 	}
 	dev_info(&dev->dev, "Boot state handshake: 0x%02x\n", us1800->scratch_buf[0]);
 
+	err = us1800_create_midi(us1800);
+	if (err < 0)
+		goto free_card;
+
 	err = us1800_alloc_urbs(us1800);
 	if (err < 0)
 		goto free_card;
@@ -296,75 +388,18 @@ static void us1800_disconnect(struct usb_interface *intf)
 		usb_kill_anchored_urbs(&us1800->playback_anchor);
 		usb_kill_anchored_urbs(&us1800->feedback_anchor);
 		usb_kill_anchored_urbs(&us1800->capture_anchor);
+		usb_kill_anchored_urbs(&us1800->midi_in_anchor);
+		usb_kill_anchored_urbs(&us1800->midi_out_anchor);
 
 		snd_card_disconnect(us1800->card);
 		cancel_work_sync(&us1800->stop_work);
+		cancel_work_sync(&us1800->midi_in_work);
+		cancel_work_sync(&us1800->midi_out_work);
 		cancel_work_sync(&us1800->stop_pcm_work);
 		usb_set_intfdata(intf, NULL);
 		snd_card_free(us1800->card);
 		atomic_dec(&dev_idx);
 	}
-}
-
-static int us1800_suspend(struct usb_interface *intf, pm_message_t message)
-{
-	struct us1800_card *us1800 = usb_get_intfdata(intf);
-
-	if (!us1800)
-		return 0;
-
-	snd_pcm_suspend_all(us1800->pcm);
-	cancel_work_sync(&us1800->stop_work);
-	cancel_work_sync(&us1800->stop_pcm_work);
-
-	usb_kill_anchored_urbs(&us1800->playback_anchor);
-	usb_kill_anchored_urbs(&us1800->feedback_anchor);
-	usb_kill_anchored_urbs(&us1800->capture_anchor);
-
-	usb_control_msg(us1800->dev, usb_sndctrlpipe(us1800->dev, 0),
-					VENDOR_REQ_POWER_CONTROL, RT_H2D_VENDOR_DEV,
-				 MODE_VAL_DEEP_SLEEP, 0x0000, NULL, 0, USB_CTRL_TIMEOUT_MS);
-
-	return 0;
-}
-
-static int us1800_resume(struct usb_interface *intf)
-{
-	struct us1800_card *us1800 = usb_get_intfdata(intf);
-	int err;
-	unsigned long flags;
-	int current_rate;
-
-	if (!us1800)
-		return 0;
-
-	usb_control_msg(us1800->dev, usb_sndctrlpipe(us1800->dev, 0),
-					VENDOR_REQ_MODE_CONTROL, RT_H2D_VENDOR_DEV,
-				 MODE_VAL_WAKE_UP, 0x0000, NULL, 0, USB_CTRL_TIMEOUT_MS);
-
-	err = usb_set_interface(us1800->dev, 0, 1);
-	if (err < 0) {
-		dev_err(&us1800->dev->dev, "Resume: failed to reset interface 0: %d\n", err);
-		return err;
-	}
-
-	err = usb_set_interface(us1800->dev, 1, 1);
-	if (err < 0) {
-		dev_err(&us1800->dev->dev, "Resume: failed to reset interface 1: %d\n", err);
-		return err;
-	}
-
-	spin_lock_irqsave(&us1800->lock, flags);
-	current_rate = us1800->current_rate;
-	spin_unlock_irqrestore(&us1800->lock, flags);
-
-	if (current_rate > 0) {
-		err = us1800_configure_device_for_rate(us1800, current_rate);
-		if (err < 0)
-			dev_err(&us1800->dev->dev, "Resume: rate re-configuration failed: %d\n", err);
-	}
-
-	return 0;
 }
 
 static const struct usb_device_id us1800_usb_ids[] = {
@@ -377,9 +412,6 @@ static struct usb_driver us1800_alsa_driver = {
 	.name = DRIVER_NAME,
 	.probe = us1800_probe,
 	.disconnect = us1800_disconnect,
-	.suspend = us1800_suspend,
-	.resume = us1800_resume,
-	.reset_resume = us1800_resume,
 	.id_table = us1800_usb_ids,
 };
 

@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 // Copyright (c) 2026 Šerif Rami <ramiserifpersia@gmail.com>
+// Revised October 2026 Paul Taggart <pjtggrt@gmail.com>
 
 #ifndef __US1800_H
 #define __US1800_H
 
+#include <linux/kfifo.h>
 #include <linux/timer.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
@@ -11,6 +13,7 @@
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
+#include <sound/rawmidi.h>
 
 #define DRIVER_NAME "us1800"
 
@@ -67,12 +70,17 @@ enum tascam_register {
 #define REG_VAL_ENABLE 0x0101
 
 #define NUM_PLAYBACK_URBS 4
-#define PLAYBACK_URB_PACKETS 8
+#define PLAYBACK_URB_PACKETS 16
 #define NUM_FEEDBACK_URBS 4
 #define FEEDBACK_URB_PACKETS 1
 #define FEEDBACK_PACKET_SIZE 3
 #define NUM_CAPTURE_URBS 8
-#define CAPTURE_PACKET_SIZE 4096
+#define CAPTURE_PACKET_SIZE 32768
+#define NUM_MIDI_IN_URBS 4
+#define MIDI_IN_BUF_SIZE 64
+#define MIDI_IN_FIFO_SIZE (MIDI_IN_BUF_SIZE * NUM_MIDI_IN_URBS)
+#define MIDI_OUT_BUF_SIZE 64
+#define NUM_MIDI_OUT_URBS 4
 
 #define BYTES_PER_SAMPLE 3
 #define PLAYBACK_CHANNELS 4
@@ -92,6 +100,7 @@ struct us1800_card {
 	struct usb_interface *iface0;
 	struct snd_card *card;
 	struct snd_pcm *pcm;
+	struct snd_rawmidi *rmidi;
 
 	u8 *scratch_buf;
 
@@ -103,13 +112,18 @@ struct us1800_card {
 	struct urb *feedback_urbs[NUM_FEEDBACK_URBS];
 	size_t feedback_urb_alloc_size;
 	struct urb *capture_urbs[NUM_CAPTURE_URBS];
+	struct urb *midi_in_urbs[NUM_MIDI_IN_URBS];
+	struct urb *midi_out_urbs[NUM_MIDI_OUT_URBS];
 
 	struct usb_anchor playback_anchor;
 	struct usb_anchor feedback_anchor;
 	struct usb_anchor capture_anchor;
+	struct usb_anchor midi_in_anchor;
+	struct usb_anchor midi_out_anchor;
 
 	spinlock_t lock;
 	atomic_t playback_active;
+	atomic_t playback_zero;
 	atomic_t capture_active;
 	atomic_t active_urbs;
 	int current_rate;
@@ -122,20 +136,67 @@ struct us1800_card {
 	snd_pcm_uframes_t driver_capture_pos;
 	u64 last_cap_period_pos;
 
+	/* --- MIDI State --- */
+	struct snd_rawmidi_substream *midi_in_substream;
+	struct snd_rawmidi_substream *midi_out_substream;
+	atomic_t midi_in_active;
+	atomic_t midi_out_active;
+	struct kfifo midi_in_fifo;
+	spinlock_t midi_in_lock;
+	spinlock_t midi_out_lock;
+	unsigned long midi_out_urbs_in_flight;
+	u8 midi_running_status;
+	struct timer_list error_timer;
+	struct completion midi_out_drain_completion;
+
 	u32 phase_accum;
 	u32 freq_q16;
 	bool feedback_synced;
 	unsigned int feedback_urb_skip_count;
+    char *silence;
 
 	bool rate_changing;
 
 	struct work_struct stop_work;
 	struct work_struct stop_pcm_work;
+	struct work_struct midi_in_work;
+	struct work_struct midi_out_work;
 };
 
 void us1800_free_urbs(struct us1800_card *us1800);
 int us1800_alloc_urbs(struct us1800_card *us1800);
 void us1800_stop_work_handler(struct work_struct *work);
+void us1800_zero_trigger(struct us1800_card *us1800, bool start);
+
+/* us1800_midi.c */
+/**
+ * tascam_midi_in_urb_complete() - Completion handler for MIDI IN URBs
+ * @urb: The completed URB.
+ *
+ * This function runs in interrupt context. It places the raw data from the
+ * USB endpoint into a kfifo and schedules a work item to process it later,
+ * ensuring the interrupt handler remains fast.
+ */
+void us1800_midi_in_urb_complete(struct urb *urb);
+
+/**
+ * tascam_midi_out_urb_complete() - Completion handler for MIDI OUT bulk URB.
+ * @urb: The completed URB.
+ *
+ * This function runs in interrupt context. It marks the output URB as no
+ * longer in-flight. It then re-schedules the work handler to check for and
+ * send any more data waiting in the ALSA buffer. This is a safe, non-blocking
+ * way to continue the data transmission chain.
+ */
+void us1800_midi_out_urb_complete(struct urb *urb);
+
+/**
+ * tascam_create_midi() - Create and initialize the ALSA rawmidi device.
+ * @tascam: The driver instance.
+ *
+ * Return: 0 on success, or a negative error code on failure.
+ */
+int us1800_create_midi(struct us1800_card *tascam);
 
 #include "us1800_pcm.h"
 

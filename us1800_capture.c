@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 Šerif Rami <ramiserifpersia@gmail.com>
+// Revised October 2026 Paul Taggart <pjtggrt@gmail.com>
 
 #include <linux/version.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
@@ -12,8 +13,7 @@
 
 const struct snd_pcm_hardware us1800_capture_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
-		 SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID |
-		 SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+		 SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID),
 	.formats = SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = (SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 		  SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000),
@@ -25,7 +25,7 @@ const struct snd_pcm_hardware us1800_capture_hw = {
 	.period_bytes_min = 768,
 	.period_bytes_max = 1024 * 1024,
 	.periods_min = 2,
-	.periods_max = 1024,
+	.periods_max = 4096,
 };
 
 static int us1800_capture_open(struct snd_pcm_substream *substream)
@@ -95,6 +95,8 @@ static int us1800_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 			}
 			if (!atomic_read(&us1800->capture_active)) {
 				atomic_set(&us1800->capture_active, 1);
+				if (!atomic_read(&us1800->playback_active))
+					us1800_zero_trigger(us1800, true);
 				start = true;
 			}
 			break;
@@ -102,6 +104,8 @@ static int us1800_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 		case SNDRV_PCM_TRIGGER_SUSPEND:
 		case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 			atomic_set(&us1800->capture_active, 0);
+			if (atomic_read(&us1800->playback_zero))
+				us1800_zero_trigger(us1800, false);
 			stop = true;
 			break;
 		default:
@@ -205,6 +209,8 @@ void capture_urb_complete(struct urb *urb)
 	}
 
 	if (urb->status) {
+		dev_warn_ratelimited(us1800->card->dev, 
+			"URB Status: %d\n", urb->status);
 		usb_unanchor_urb(urb);
 		atomic_dec(&us1800->active_urbs);
 		return;

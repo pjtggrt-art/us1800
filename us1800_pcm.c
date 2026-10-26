@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 Šerif Rami <ramiserifpersia@gmail.com>
+// Revised October 2026 Paul Taggart <pjtggrt@gmail.com>
 
 #include "us1800_pcm.h"
 
@@ -107,8 +108,13 @@ int us1800_configure_device_for_rate(struct us1800_card *us1800, int rate)
 	err = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
 						  VENDOR_REQ_MODE_CONTROL, RT_H2D_VENDOR_DEV,
 						  MODE_VAL_STREAM_START_US1800, 0x0000, NULL, 0, USB_CTRL_TIMEOUT_MS);
+	if (err < 0)
+		goto out;
+
 
 	out:
+	if (err < 0)
+		dev_err(&dev->dev, "Stream Rate Change Failed: %d Hz %d\n", rate, err);
 	kfree(rate_payload);
 	return err;
 }
@@ -167,3 +173,4 @@ void us1800_stop_pcm_work_handler(struct work_struct *work)
 	if (us1800->capture_substream)
 		snd_pcm_stop(us1800->capture_substream, SNDRV_PCM_STATE_XRUN);
 }
+

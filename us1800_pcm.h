@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 // Copyright (c) 2026 Šerif Rami <ramiserifpersia@gmail.com>
+// Revised October 2026 Paul Taggart <pjtggrt@gmail.com>
 
 #ifndef __US1800_PCM_H
 #define __US1800_PCM_H
