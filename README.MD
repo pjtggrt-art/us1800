@@ -46,7 +46,7 @@ This process will build the module from source and load it for your current sess
 1.  Clone this repository and navigate into the source directory.
 
 ```bash
-git clone https://github.com/serifpersia/us1800.git
+git clone https://github.com/pjtggrt-art/us1800.git
 cd us1800/
 ```
 
